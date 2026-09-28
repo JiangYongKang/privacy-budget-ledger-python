@@ -6,6 +6,22 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/privacy_budget_ledger"]
+
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -s"
