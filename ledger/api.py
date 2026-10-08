@@ -16,8 +16,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from ledger.errors import LedgerError
-from ledger.models import DatasetCharge
+from ledger.errors import InvalidParameterError, LedgerError
+from ledger.models import DatasetCharge, ReservationItem
 from ledger.service import BudgetService, build_default_service
 
 DEFAULT_DB_PATH = os.environ.get("BUDGET_LEDGER_DB", "data/budget_ledger.db")
@@ -57,6 +57,46 @@ class ConsumeBody(BaseModel):
     query_id: str = Field(min_length=1, description="全局唯一查询标识，用于幂等")
     analyst_id: str = Field(min_length=1)
     charges: list[ChargeBody] = Field(min_length=1)
+
+
+class ReserveItemBody(BaseModel):
+    dataset_id: str = Field(min_length=1)
+    amount: float = Field(gt=0, description="预占额度（正数）")
+
+    @field_validator("amount")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("amount 必须是有限数")
+        return v
+
+
+class ReserveBody(BaseModel):
+    reservation_id: str = Field(min_length=1, description="预占标识，后续结算/归还复用")
+    analyst_id: str = Field(min_length=1)
+    items: list[ReserveItemBody] = Field(min_length=1)
+    ttl_seconds: float | None = Field(default=None, gt=0, description="预占有效期，缺省用服务端配置")
+
+
+class SettleItemBody(BaseModel):
+    dataset_id: str = Field(min_length=1)
+    amount: float = Field(ge=0, description="实际用量，0 表示该数据集全额退回")
+
+    @field_validator("amount")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("amount 必须是有限数")
+        return v
+
+
+class SettleBody(BaseModel):
+    analyst_id: str = Field(min_length=1)
+    actual: list[SettleItemBody] = Field(min_length=1)
+
+
+class ReleaseBody(BaseModel):
+    analyst_id: str = Field(min_length=1)
 
 
 # ---------------------------------------------------------------------- #
@@ -205,7 +245,109 @@ def create_app(service: BudgetService | None = None) -> FastAPI:
             ],
         }
 
+    # ---- 预占：先占额度、后结算/归还 ----
+    @app.post("/reservations", status_code=201)
+    def reserve(body: ReserveBody) -> dict[str, object]:
+        dataset_ids = [i.dataset_id for i in body.items]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise InvalidParameterError(
+                "同一次预占中存在重复的 dataset_id，请先合并预占项",
+                details={"field": "items.dataset_id", "values": dataset_ids},
+            )
+        result = service.reserve(
+            reservation_id=body.reservation_id,
+            analyst_id=body.analyst_id,
+            items=[
+                ReservationItem(dataset_id=i.dataset_id, amount=i.amount)
+                for i in body.items
+            ],
+            ttl_seconds=body.ttl_seconds,
+        )
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": "idempotent_replay" if result.replay else "accepted",
+            "expires_at": result.expires_at,
+            "items": [_hold_dict(i) for i in result.items],
+        }
+
+    @app.post("/reservations/{reservation_id}/settle")
+    def settle_reservation(reservation_id: str, body: SettleBody) -> dict[str, object]:
+        dataset_ids = [i.dataset_id for i in body.actual]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            raise InvalidParameterError(
+                "结算中存在重复的 dataset_id，请先合并结算项",
+                details={"field": "actual.dataset_id", "values": dataset_ids},
+            )
+        result = service.settle(
+            reservation_id=reservation_id,
+            analyst_id=body.analyst_id,
+            actual=[
+                ReservationItem(dataset_id=i.dataset_id, amount=i.amount)
+                for i in body.actual
+            ],
+        )
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": "idempotent_replay" if result.replay else "settled",
+            "total_settled": result.total_settled,
+            "total_refunded": result.total_refunded,
+            "items": [_hold_dict(i) for i in result.items],
+        }
+
+    @app.post("/reservations/{reservation_id}/release")
+    def release_reservation(reservation_id: str, body: ReleaseBody) -> dict[str, object]:
+        result = service.release(
+            reservation_id=reservation_id,
+            analyst_id=body.analyst_id,
+        )
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": "idempotent_replay" if result.replay else result.status,
+            "total_refunded": result.total_refunded,
+            "items": [_hold_dict(i) for i in result.items],
+        }
+
+    @app.get("/reservations/{reservation_id}")
+    def get_reservation(reservation_id: str, analyst_id: str | None = None) -> dict[str, object]:
+        record = service.get_reservation(reservation_id)
+        if record is None or (analyst_id is not None and record.analyst_id != analyst_id):
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": {
+                        "code": "reservation_not_found",
+                        "message": f"预占不存在: {reservation_id}",
+                        "details": {"reservation_id": reservation_id},
+                    }
+                },
+            )
+        return {
+            "reservation_id": record.reservation_id,
+            "analyst_id": record.analyst_id,
+            "status": record.status,
+            "created_at": record.created_at,
+            "expires_at": record.expires_at,
+            "items": [
+                {"dataset_id": i.dataset_id, "amount": i.amount}
+                for i in record.items
+            ],
+        }
+
     return app
+
+
+def _hold_dict(item) -> dict[str, object]:
+    return {
+        "dataset_id": item.dataset_id,
+        "reserved": item.reserved,
+        "settled": item.settled,
+        "refunded": item.refunded,
+        "balance_before": item.balance_before,
+        "balance_after": item.balance_after,
+    }
 
 
 def _balance_dict(view) -> dict[str, object]:
@@ -215,6 +357,8 @@ def _balance_dict(view) -> dict[str, object]:
         "limit": view.limit,
         "consumed": view.consumed,
         "balance": view.balance,
+        "reserved": view.reserved,
+        "available": view.available,
     }
 
 

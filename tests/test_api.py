@@ -39,7 +39,8 @@ def test_consume_and_idempotent_replay_over_http(client):
 
     bal = client.get("/analysts/a1/datasets/d1/balance").json()
     assert bal == {"analyst_id": "a1", "dataset_id": "d1",
-                   "limit": 10.0, "consumed": 3.0, "balance": 7.0}
+                   "limit": 10.0, "consumed": 3.0, "balance": 7.0,
+                   "reserved": 0.0, "available": 7.0}
     rec = client.get("/queries/http-q1").json()
     assert rec["total_charged"] == 5.0
 

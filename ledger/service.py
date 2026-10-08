@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterable
+import os
+import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 from ledger.errors import (
@@ -19,17 +21,38 @@ from ledger.errors import (
     LedgerError,
     UnauthorizedDatasetError,
 )
-from ledger.models import BalanceView, ConsumeResult, DatasetCharge
+from ledger.models import (
+    BalanceView,
+    ConsumeResult,
+    DatasetCharge,
+    ReleaseResult,
+    ReservationItem,
+    ReservationView,
+    ReserveResult,
+    SettleResult,
+)
 from ledger.store import LedgerStore
 
 logger = logging.getLogger("privacy_budget_ledger")
+
+DEFAULT_RESERVATION_TTL_SECONDS = float(
+    os.environ.get("BUDGET_LEDGER_RESERVATION_TTL", "3600")
+)
 
 
 class BudgetService:
     """面向分析者的预算记账服务（无状态，状态全部在 store）。"""
 
-    def __init__(self, store: LedgerStore) -> None:
+    def __init__(
+        self,
+        store: LedgerStore,
+        *,
+        default_ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self._store = store
+        self._default_ttl_seconds = default_ttl_seconds
+        self._clock = clock
 
     # ------------------------------------------------------------------ #
     # 管理面
@@ -189,6 +212,193 @@ class BudgetService:
         query_id = _require_nonempty_id(query_id, "query_id")
         return self._store.get_consume_record(query_id)
 
+    # ------------------------------------------------------------------ #
+    # 预占面（先预占、后结算/归还）
+    # ------------------------------------------------------------------ #
+    def reserve(
+        self,
+        *,
+        reservation_id: str,
+        analyst_id: str,
+        items: Iterable[ReservationItem],
+        ttl_seconds: float | None = None,
+    ) -> ReserveResult:
+        """先占住额度：跨数据集全占上或整体不生效；同标识重复提交幂等。"""
+        reservation_id = _require_nonempty_id(reservation_id, "reservation_id")
+        analyst_id = _require_nonempty_id(analyst_id, "analyst_id")
+        normalized = _validate_reservation_items(items)
+        ttl = self._resolve_ttl(ttl_seconds)
+
+        self._require_entities_authorized(reservation_id, analyst_id, normalized)
+
+        try:
+            result = self._store.reserve(
+                reservation_id=reservation_id,
+                analyst_id=analyst_id,
+                items=normalized,
+                ttl_seconds=ttl,
+            )
+        except LedgerError as exc:
+            logger.warning(
+                "reserve失败回滚 reservation_id=%s analyst_id=%s 判定依据=%s(整体不生效,无任何占用)",
+                reservation_id, analyst_id, exc.code,
+            )
+            raise
+
+        verdict = (
+            "idempotent_replay(同一预占重复提交,不重复占用)"
+            if result.replay else "accepted(首次提交,已预占)"
+        )
+        for item in result.items:
+            logger.info(
+                "reserve结论 reservation_id=%s analyst_id=%s dataset_id=%s "
+                "本次预占=%.6f 占用后可用=%.6f 到期=%s 判定依据=%s",
+                reservation_id, analyst_id, item.dataset_id,
+                item.reserved, item.balance_after, result.expires_at, verdict,
+            )
+        return result
+
+    def settle(
+        self,
+        *,
+        reservation_id: str,
+        analyst_id: str,
+        actual: Iterable[ReservationItem],
+    ) -> SettleResult:
+        """按实际用量结算：多占退回；过期预占被明确拒绝；重复提交幂等。"""
+        reservation_id = _require_nonempty_id(reservation_id, "reservation_id")
+        analyst_id = _require_nonempty_id(analyst_id, "analyst_id")
+        normalized = _validate_actual_usage(actual)
+
+        try:
+            result = self._store.settle_reservation(
+                reservation_id=reservation_id,
+                analyst_id=analyst_id,
+                actual=normalized,
+            )
+        except LedgerError as exc:
+            logger.warning(
+                "settle拒绝 reservation_id=%s analyst_id=%s 判定依据=%s(不动任何额度)",
+                reservation_id, analyst_id, exc.code,
+            )
+            raise
+
+        verdict = (
+            "idempotent_replay(同一结算重复提交,不重复扣账)"
+            if result.replay else "settled(占用转扣减,多占退回)"
+        )
+        for item in result.items:
+            logger.info(
+                "settle结论 reservation_id=%s analyst_id=%s dataset_id=%s "
+                "预占=%.6f 实际结算=%.6f 退回=%.6f 结算后可用=%.6f 判定依据=%s",
+                reservation_id, analyst_id, item.dataset_id,
+                item.reserved, item.settled, item.refunded,
+                item.balance_after, verdict,
+            )
+        return result
+
+    def release(
+        self,
+        *,
+        reservation_id: str,
+        analyst_id: str,
+    ) -> ReleaseResult:
+        """任务取消时整笔归还预占；重复提交只生效一次。"""
+        reservation_id = _require_nonempty_id(reservation_id, "reservation_id")
+        analyst_id = _require_nonempty_id(analyst_id, "analyst_id")
+
+        try:
+            result = self._store.release_reservation(
+                reservation_id=reservation_id,
+                analyst_id=analyst_id,
+            )
+        except LedgerError as exc:
+            logger.warning(
+                "release拒绝 reservation_id=%s analyst_id=%s 判定依据=%s",
+                reservation_id, analyst_id, exc.code,
+            )
+            raise
+
+        verdict = (
+            "idempotent_replay(同一归还重复提交,不重复退回)"
+            if result.replay else "released(整笔归还,占用释放)"
+        )
+        for item in result.items:
+            logger.info(
+                "release结论 reservation_id=%s analyst_id=%s dataset_id=%s "
+                "退回预占=%.6f 归还后可用=%.6f 判定依据=%s",
+                reservation_id, analyst_id, item.dataset_id,
+                item.refunded, item.balance_after, verdict,
+            )
+        return result
+
+    def get_reservation(self, reservation_id: str) -> ReservationView | None:
+        reservation_id = _require_nonempty_id(reservation_id, "reservation_id")
+        return self._store.get_reservation(reservation_id)
+
+    def sweep_expired(self) -> int:
+        """主动把到期未结算/归还的预占置为 expired 并释放占用。"""
+        n = self._store.sweep_expired()
+        if n:
+            logger.info("sweep_expired结论 释放过期预占=%d笔 判定依据=expires_at<=now", n)
+        return n
+
+    # ------------------------------------------------------------------ #
+    # 预占辅助
+    # ------------------------------------------------------------------ #
+    def _resolve_ttl(self, ttl_seconds: float | None) -> float:
+        ttl = self._default_ttl_seconds if ttl_seconds is None else ttl_seconds
+        if not _is_finite_number(ttl) or ttl <= 0:
+            raise InvalidParameterError(
+                "ttl_seconds 必须是正的有限数",
+                details={"field": "ttl_seconds", "value": ttl},
+            )
+        return float(ttl)
+
+    def _require_entities_authorized(
+        self,
+        request_id: str,
+        analyst_id: str,
+        items: list[tuple[str, float]],
+    ) -> None:
+        """事务外先给出可区分的实体/授权错误（store 事务内仍会复核）。"""
+        if not self._store.analyst_exists(analyst_id):
+            logger.warning(
+                "reserve拒绝 reservation_id=%s analyst_id=%s 依据=analyst_not_found",
+                request_id, analyst_id,
+            )
+            raise AnalystNotFoundError(
+                f"分析者不存在: {analyst_id}",
+                details={"analyst_id": analyst_id, "reservation_id": request_id},
+            )
+        for dataset_id, _amount in items:
+            if not self._store.dataset_exists(dataset_id):
+                logger.warning(
+                    "reserve拒绝 reservation_id=%s analyst_id=%s dataset_id=%s 依据=dataset_not_found",
+                    request_id, analyst_id, dataset_id,
+                )
+                raise DatasetNotFoundError(
+                    f"数据集不存在: {dataset_id}",
+                    details={
+                        "dataset_id": dataset_id,
+                        "analyst_id": analyst_id,
+                        "reservation_id": request_id,
+                    },
+                )
+            if not self._store.is_authorized(analyst_id, dataset_id):
+                logger.warning(
+                    "reserve拒绝 reservation_id=%s analyst_id=%s dataset_id=%s 依据=unauthorized_dataset",
+                    request_id, analyst_id, dataset_id,
+                )
+                raise UnauthorizedDatasetError(
+                    f"分析者 {analyst_id} 未被授权访问数据集 {dataset_id}",
+                    details={
+                        "analyst_id": analyst_id,
+                        "dataset_id": dataset_id,
+                        "reservation_id": request_id,
+                    },
+                )
+
 
 # ---------------------------------------------------------------------- #
 # 参数校验辅助
@@ -238,7 +448,81 @@ def _validate_charges(
     return normalized
 
 
-def build_default_service(db_path: str | Path = ":memory:") -> BudgetService:
+def _validate_reservation_items(
+    items: Iterable[ReservationItem],
+) -> list[tuple[str, float]]:
+    raw = list(items)
+    if not raw:
+        raise InvalidParameterError(
+            "items 至少包含一个预占项", details={"field": "items"}
+        )
+    normalized: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw):
+        if not isinstance(item, ReservationItem):
+            raise InvalidParameterError(
+                f"items[{idx}] 必须是 ReservationItem",
+                details={"field": f"items[{idx}]", "value": repr(item)},
+            )
+        dataset_id = _require_nonempty_id(item.dataset_id, f"items[{idx}].dataset_id")
+        if not _is_finite_number(item.amount) or item.amount <= 0:
+            raise InvalidParameterError(
+                f"items[{idx}].amount 必须是正数",
+                details={"field": f"items[{idx}].amount", "value": item.amount},
+            )
+        if dataset_id in seen:
+            raise InvalidParameterError(
+                f"同一次预占中数据集 {dataset_id} 出现多次，请合并预占项",
+                details={"field": f"items[{idx}].dataset_id", "dataset_id": dataset_id},
+            )
+        seen.add(dataset_id)
+        normalized.append((dataset_id, float(item.amount)))
+    return normalized
+
+
+def _validate_actual_usage(
+    actual: Iterable[ReservationItem],
+) -> list[tuple[str, float]]:
+    raw = list(actual)
+    if not raw:
+        raise InvalidParameterError(
+            "actual 至少包含一个结算项", details={"field": "actual"}
+        )
+    normalized: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw):
+        if not isinstance(item, ReservationItem):
+            raise InvalidParameterError(
+                f"actual[{idx}] 必须是 ReservationItem",
+                details={"field": f"actual[{idx}]", "value": repr(item)},
+            )
+        dataset_id = _require_nonempty_id(item.dataset_id, f"actual[{idx}].dataset_id")
+        if not _is_finite_number(item.amount) or item.amount < 0:
+            raise InvalidParameterError(
+                f"actual[{idx}].amount 必须是非负数（0 表示全额退回）",
+                details={"field": f"actual[{idx}].amount", "value": item.amount},
+            )
+        if dataset_id in seen:
+            raise InvalidParameterError(
+                f"结算中数据集 {dataset_id} 出现多次，请合并结算项",
+                details={"field": f"actual[{idx}].dataset_id", "dataset_id": dataset_id},
+            )
+        seen.add(dataset_id)
+        normalized.append((dataset_id, float(item.amount)))
+    return normalized
+
+
+def build_default_service(
+    db_path: str | Path = ":memory:",
+    *,
+    default_ttl_seconds: float | None = None,
+    clock: Callable[[], float] = time.time,
+) -> BudgetService:
     """构造并打开一个默认服务实例。"""
-    store = LedgerStore(db_path).open()
-    return BudgetService(store)
+    ttl = (
+        DEFAULT_RESERVATION_TTL_SECONDS
+        if default_ttl_seconds is None
+        else float(default_ttl_seconds)
+    )
+    store = LedgerStore(db_path, clock=clock).open()
+    return BudgetService(store, default_ttl_seconds=ttl, clock=clock)

@@ -15,8 +15,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ledger.errors import BudgetInsufficientError, LedgerError
-from ledger.models import DatasetCharge
+from ledger.errors import (
+    BudgetInsufficientError,
+    LedgerError,
+    ReservationExpiredError,
+)
+from ledger.models import DatasetCharge, ReservationItem
 from ledger.service import build_default_service
 
 
@@ -24,9 +28,20 @@ def show(title: str) -> None:
     print(f"\n=== {title} ===")
 
 
+class Clock:
+    """可控时钟：方便本地把预占有效期调短快速验证。"""
+
+    def __init__(self, t: float = 10_000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
 def main() -> None:
     db = Path(tempfile.mkdtemp()) / "demo.db"
-    svc = build_default_service(db)
+    clock = Clock()
+    svc = build_default_service(db, default_ttl_seconds=3600, clock=clock)
 
     show("1. 注册分析者/数据集并授权：a1 -> d1=10.0, d2=5.0；a2 -> d1=2.0")
     svc.register_analyst("a1")
@@ -78,12 +93,62 @@ def main() -> None:
     print("d1 消耗仍为:", svc.get_balance("a1", "d1").consumed,
           " d2 消耗仍为:", svc.get_balance("a1", "d2").consumed)
 
-    show("6. 重启服务（重新打开同一文件库），额度与查询记录保留")
+    show("6. 预占：组合预占 rv-1（d1=3, d2=2），占用计入统一口径")
+    hold = svc.reserve(
+        reservation_id="rv-1", analyst_id="a1",
+        items=[ReservationItem("d1", 3.0), ReservationItem("d2", 2.0)],
+    )
+    print("status:", "idempotent_replay" if hold.replay else "accepted",
+          "expires_at:", hold.expires_at)
+    b = svc.get_balance("a1", "d1")
+    print("d1 已扣:", b.consumed, " 预占中:", b.reserved, " 可用:", b.available)
+
+    show("7. 预占期间直接扣减受同一口径约束：d1 再扣 4 > 可用 3 -> budget_insufficient")
+    try:
+        svc.consume(query_id="q-blocked", analyst_id="a1",
+                    charges=[DatasetCharge("d1", 4.0)])
+    except BudgetInsufficientError as e:
+        print("被拒绝:", e.code)
+
+    show("8. 按实际用量结算 rv-1：d1 实际2(退1)、d2 实际1(退1)，多占退回")
+    settled = svc.settle(
+        reservation_id="rv-1", analyst_id="a1",
+        actual=[ReservationItem("d1", 2.0), ReservationItem("d2", 1.0)],
+    )
+    print("结算:", settled.total_settled, " 退回:", settled.total_refunded)
+    print("重复结算 ->",
+          "idempotent_replay" if svc.settle(
+              reservation_id="rv-1", analyst_id="a1",
+              actual=[ReservationItem("d1", 2.0), ReservationItem("d2", 1.0)],
+          ).replay else "??")
+
+    show("9. 任务取消整笔归还 rv-2，重复归还只生效一次")
+    svc.reserve(reservation_id="rv-2", analyst_id="a1",
+                items=[ReservationItem("d1", 2.0)])
+    rel1 = svc.release(reservation_id="rv-2", analyst_id="a1")
+    rel2 = svc.release(reservation_id="rv-2", analyst_id="a1")
+    print("首次:", rel1.status, rel1.total_refunded,
+          " 重复:", "idempotent_replay" if rel2.replay else "??")
+
+    show("10. 预占有效期：ttl=5，把时钟拨到到期后，结算被明确拒绝并自动释放")
+    svc.reserve(reservation_id="rv-3", analyst_id="a1",
+                items=[ReservationItem("d1", 2.0)], ttl_seconds=5.0)
+    clock.t += 6
+    try:
+        svc.settle(reservation_id="rv-3", analyst_id="a1",
+                   actual=[ReservationItem("d1", 1.0)])
+    except ReservationExpiredError as e:
+        print("被拒绝:", e.code, " 状态:", svc.get_reservation("rv-3").status)
+    print("d1 预占中:", svc.get_balance("a1", "d1").reserved,
+          " 可用:", svc.get_balance("a1", "d1").available)
+
+    show("11. 重启服务（重新打开同一文件库），额度、查询与在持预占保留")
     svc._store.close()
-    svc = build_default_service(db)
+    svc = build_default_service(db, default_ttl_seconds=3600, clock=clock)
     print("d1:", svc.get_balance("a1", "d1"))
     print("d2:", svc.get_balance("a1", "d2"))
     print("q-1 记录:", svc.get_query_record("q-1").total_charged)
+    print("rv-3 状态:", svc.get_reservation("rv-3").status)
     svc._store.close()
 
 

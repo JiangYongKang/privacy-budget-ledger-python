@@ -50,3 +50,30 @@ class LedgerRollbackError(LedgerError):
 
     code = "ledger_rollback_detected"
     http_status = 500
+
+
+# ---- 预占（先占额度、后结算）相关错误 ----
+class ReservationNotFoundError(LedgerError):
+    code = "reservation_not_found"
+    http_status = 404
+
+
+class ReservationExpiredError(LedgerError):
+    """预占已过有效期并被自动释放，再拿去结算必须被明确拒绝。"""
+
+    code = "reservation_expired"
+    http_status = 410
+
+
+class ReservationConflictError(LedgerError):
+    """同一预占标识被提交了不一致的内容（数据集/金额/分析者）。"""
+
+    code = "reservation_conflict"
+    http_status = 409
+
+
+class ReservationStateError(LedgerError):
+    """预占当前状态不允许该操作（如对已归还的预占做结算）。"""
+
+    code = "reservation_state_invalid"
+    http_status = 409
