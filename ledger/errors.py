@@ -50,3 +50,31 @@ class LedgerRollbackError(LedgerError):
 
     code = "ledger_rollback_detected"
     http_status = 500
+
+
+class ReservationNotFoundError(LedgerError):
+    """预占标识不存在。"""
+
+    code = "reservation_not_found"
+    http_status = 404
+
+
+class ReservationExpiredError(LedgerError):
+    """预占已过期：占用已自动释放，不能再据此结算。"""
+
+    code = "reservation_expired"
+    http_status = 409
+
+
+class ReservationClosedError(LedgerError):
+    """预占已终结（已结算/已归还），不能再执行与之互斥的操作。"""
+
+    code = "reservation_closed"
+    http_status = 409
+
+
+class ReservationConflictError(LedgerError):
+    """同一预占标识被用于与首次不一致的内容/分析者。"""
+
+    code = "reservation_conflict"
+    http_status = 409

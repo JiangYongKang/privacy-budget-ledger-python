@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from ledger.errors import LedgerError
-from ledger.models import DatasetCharge
+from ledger.models import DatasetCharge, ReservationCharge
 from ledger.service import BudgetService, build_default_service
 
 DEFAULT_DB_PATH = os.environ.get("BUDGET_LEDGER_DB", "data/budget_ledger.db")
@@ -57,6 +57,50 @@ class ConsumeBody(BaseModel):
     query_id: str = Field(min_length=1, description="全局唯一查询标识，用于幂等")
     analyst_id: str = Field(min_length=1)
     charges: list[ChargeBody] = Field(min_length=1)
+
+
+class ReserveChargeBody(BaseModel):
+    dataset_id: str = Field(min_length=1)
+    amount: float = Field(gt=0, description="预占量（正数）")
+
+    @field_validator("amount")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("amount 必须是有限数")
+        return v
+
+
+class SettleChargeBody(BaseModel):
+    dataset_id: str = Field(min_length=1)
+    amount: float = Field(ge=0, description="实际用量（非负，0 表示该数据集没用）")
+
+    @field_validator("amount")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("amount 必须是有限数")
+        return v
+
+
+class ReserveBody(BaseModel):
+    reservation_id: str = Field(min_length=1, description="预占标识，用于幂等与后续结算/归还")
+    analyst_id: str = Field(min_length=1)
+    charges: list[ReserveChargeBody] = Field(min_length=1)
+    ttl_seconds: int | None = Field(
+        default=None, ge=1, description="有效期秒数；不传用服务默认值"
+    )
+
+
+class SettleBody(BaseModel):
+    reservation_id: str = Field(min_length=1)
+    analyst_id: str = Field(min_length=1)
+    charges: list[SettleChargeBody] = Field(min_length=1)
+
+
+class ReleaseBody(BaseModel):
+    reservation_id: str = Field(min_length=1)
+    analyst_id: str = Field(min_length=1)
 
 
 # ---------------------------------------------------------------------- #
@@ -205,6 +249,113 @@ def create_app(service: BudgetService | None = None) -> FastAPI:
             ],
         }
 
+    @app.post("/reservations", status_code=201)
+    def reserve(body: ReserveBody) -> dict[str, object]:
+        dataset_ids = [c.dataset_id for c in body.charges]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            from ledger.errors import InvalidParameterError
+
+            raise InvalidParameterError(
+                "同一次预占中存在重复的 dataset_id，请先合并预占项",
+                details={"field": "charges.dataset_id", "values": dataset_ids},
+            )
+        result = service.reserve_budget(
+            reservation_id=body.reservation_id,
+            analyst_id=body.analyst_id,
+            charges=[
+                ReservationCharge(dataset_id=c.dataset_id, amount=c.amount)
+                for c in body.charges
+            ],
+            ttl_seconds=body.ttl_seconds,
+        )
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": "idempotent_replay" if result.replay else result.status,
+            "expires_at": result.expires_at,
+            "ttl_seconds": result.ttl_seconds,
+            "total_reserved": result.total_reserved,
+            "items": [
+                {
+                    "dataset_id": i.dataset_id,
+                    "reserved": i.reserved,
+                    "available_before": i.available_before,
+                    "available_after": i.available_after,
+                }
+                for i in result.items
+            ],
+        }
+
+    @app.post("/reservations/settle")
+    def settle(body: SettleBody) -> dict[str, object]:
+        dataset_ids = [c.dataset_id for c in body.charges]
+        if len(dataset_ids) != len(set(dataset_ids)):
+            from ledger.errors import InvalidParameterError
+
+            raise InvalidParameterError(
+                "同一次结算中存在重复的 dataset_id，请先合并结算项",
+                details={"field": "charges.dataset_id", "values": dataset_ids},
+            )
+        result = service.settle_reservation(
+            reservation_id=body.reservation_id,
+            analyst_id=body.analyst_id,
+            charges=[
+                ReservationCharge(dataset_id=c.dataset_id, amount=c.amount)
+                for c in body.charges
+            ],
+        )
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": "idempotent_replay" if result.replay else "settled",
+            "total_charged": result.total_charged,
+            "total_refunded": result.total_refunded,
+            "items": [
+                {
+                    "dataset_id": i.dataset_id,
+                    "reserved": i.reserved,
+                    "charged": i.charged,
+                    "refunded": i.refunded,
+                    "available_after": i.available_after,
+                }
+                for i in result.items
+            ],
+        }
+
+    @app.post("/reservations/release")
+    def release(body: ReleaseBody) -> dict[str, object]:
+        result = service.release_reservation(
+            reservation_id=body.reservation_id,
+            analyst_id=body.analyst_id,
+        )
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": "idempotent_replay" if result.replay else result.status,
+            "total_refunded": result.total_refunded,
+        }
+
+    @app.post("/reservations/sweep-expired")
+    def sweep_expired() -> dict[str, object]:
+        expired_ids = service.sweep_expired_reservations()
+        return {"expired": expired_ids, "count": len(expired_ids)}
+
+    @app.get("/reservations/{reservation_id}")
+    def get_reservation(reservation_id: str) -> dict[str, object]:
+        result = service.get_reservation(reservation_id)
+        return {
+            "reservation_id": result.reservation_id,
+            "analyst_id": result.analyst_id,
+            "status": result.status,
+            "expires_at": result.expires_at,
+            "ttl_seconds": result.ttl_seconds,
+            "total_reserved": result.total_reserved,
+            "items": [
+                {"dataset_id": i.dataset_id, "reserved": i.reserved}
+                for i in result.items
+            ],
+        }
+
     return app
 
 
@@ -215,6 +366,8 @@ def _balance_dict(view) -> dict[str, object]:
         "limit": view.limit,
         "consumed": view.consumed,
         "balance": view.balance,
+        "reserved": view.reserved,
+        "available": view.available,
     }
 
 
